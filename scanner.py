@@ -94,16 +94,16 @@ def main() -> None:
     filtered.sort(key=lambda p: p["_ratio"], reverse=True)
 
     print(
-        f"{'Проект':16s} {'Пара':22s} {'TVL':>13s} {'APY':>7s} {'30д':>7s} "
+        f"{'Сеть':10s} {'Проект':16s} {'Пара':22s} {'TVL':>13s} {'APY':>7s} {'30д':>7s} "
         f"{'об/TVL':>8s} {'IL':>4s} {'Прогноз':>10s}"
     )
-    print("-" * 92)
+    print("-" * 103)
     for p in filtered[: args.top]:
         spike = p["_spike"]
         spike_str = f"{spike:+.0f}%" if spike is not None else "?"
         pred = (p.get("predictions") or {}).get("predictedClass") or "?"
         print(
-            f"{p['project']:16.16s} {p['symbol']:22.22s} "
+            f"{p['chain']:10.10s} {p['project']:16.16s} {p['symbol']:22.22s} "
             f"${p['tvlUsd']:>11,.0f} {p['apy']:>6.1f}% {spike_str:>7s} "
             f"{p['_ratio'] * 100:>7.1f}% {p.get('ilRisk', '?'):>4s} {pred:>10s}"
         )
