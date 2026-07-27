@@ -33,6 +33,17 @@ def daily_turnover_ratio(pool: dict) -> float | None:
     return (vol7d / 7) / tvl
 
 
+def apy_spike_pct(pool: dict) -> float | None:
+    """На сколько % текущий APY выше среднего за 30 дней — большое положительное
+    значение обычно значит разовый всплеск (например памп объёма вчера), а не
+    устойчивую доходность; отрицательное — текущий APY просел ниже своей нормы."""
+    apy = pool.get("apy")
+    mean30d = pool.get("apyMean30d")
+    if apy is None or not mean30d:
+        return None
+    return (apy - mean30d) / mean30d * 100
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="DeFi LP-сканер поверх DeFiLlama")
     parser.add_argument("--chain", default="Solana", help="Сеть (пусто/'' = все сети)")
@@ -45,6 +56,11 @@ def main() -> None:
     parser.add_argument(
         "--exposure", choices=["single", "multi", "any"], default="multi",
         help="multi = LP-пара (по умолчанию), single = обычно стейкинг/лендинг одного токена",
+    )
+    parser.add_argument(
+        "--max-apy-spike", type=float, default=None,
+        help="Отсечь пулы, где текущий APY выше среднего за 30д больше чем на X%% "
+        "(защита от разовых всплесков объёма, не устойчивой доходности)",
     )
     args = parser.parse_args()
 
@@ -66,24 +82,35 @@ def main() -> None:
         ratio = daily_turnover_ratio(p)
         if ratio is None:
             continue
+
+        spike = apy_spike_pct(p)
+        if args.max_apy_spike is not None and spike is not None and spike > args.max_apy_spike:
+            continue
+
         p["_ratio"] = ratio
+        p["_spike"] = spike
         filtered.append(p)
 
     filtered.sort(key=lambda p: p["_ratio"], reverse=True)
 
     print(
-        f"{'Проект':16s} {'Пара':22s} {'TVL':>13s} {'APY':>7s} "
-        f"{'об/TVL в день':>14s} {'IL':>4s}"
+        f"{'Проект':16s} {'Пара':22s} {'TVL':>13s} {'APY':>7s} {'30д':>7s} "
+        f"{'об/TVL':>8s} {'IL':>4s} {'Прогноз':>10s}"
     )
-    print("-" * 84)
+    print("-" * 92)
     for p in filtered[: args.top]:
+        spike = p["_spike"]
+        spike_str = f"{spike:+.0f}%" if spike is not None else "?"
+        pred = (p.get("predictions") or {}).get("predictedClass") or "?"
         print(
             f"{p['project']:16.16s} {p['symbol']:22.22s} "
-            f"${p['tvlUsd']:>11,.0f} {p['apy']:>6.1f}% "
-            f"{p['_ratio'] * 100:>13.1f}% {p.get('ilRisk', '?'):>4s}"
+            f"${p['tvlUsd']:>11,.0f} {p['apy']:>6.1f}% {spike_str:>7s} "
+            f"{p['_ratio'] * 100:>7.1f}% {p.get('ilRisk', '?'):>4s} {pred:>10s}"
         )
 
     print(f"\nВсего пулов после фильтров: {len(filtered)} (показаны первые {args.top})")
+    print("30д = на сколько % текущий APY выше/ниже среднего за 30 дней "
+          "(большой + = вероятно разовый всплеск, не устойчивый доход)")
 
 
 if __name__ == "__main__":
