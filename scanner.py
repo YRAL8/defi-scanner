@@ -333,8 +333,17 @@ def main() -> None:
     if args.beat:
         beat_pool = parse_beat(args.beat, pools)
         beat_apy = beat_pool.get("apy") or 0
-        print(f"Сравниваю с {args.beat}: APY={beat_apy:.1f}% — показаны только пулы выше этого.\n")
+        print(
+            f"Сравниваю с {args.beat}: APY={beat_apy:.1f}%. Порядок такой: сначала "
+            f"фильтры доверия (возраст/TVL/и т.п.) отсеивают мусор, ПОТОМ среди "
+            f"оставшихся сортирую по разнице с этим APY — сверху то, что обгоняет "
+            f"сильнее всего, ниже — то, что близко, но пока хуже. Ничего не скрываю, "
+            f"просто ранжирую.\n"
+        )
 
+    # Порядок фильтров — намеренно "доверие сначала": возраст/TVL/минимальный APY
+    # прежде, чем вообще сравнивать с эталоном. Пул моложе --min-age-days или с
+    # тонким TVL отсекается независимо от того, насколько высокий у него APY.
     filtered = []
     for p in pools:
         if not is_usable_pool(p):
@@ -353,8 +362,6 @@ def main() -> None:
             continue
         if args.min_age_days and (p.get("count") or 0) < args.min_age_days:
             continue
-        if beat_apy is not None and (p.get("apy") or 0) <= beat_apy:
-            continue
 
         ratio = daily_turnover_ratio(p)
         if ratio is None:
@@ -367,26 +374,35 @@ def main() -> None:
         p["_ratio"] = ratio
         p["_spike"] = spike
         p["_audits"] = audits_by_slug.get(p.get("project"), 0)
+        if beat_apy is not None:
+            p["_vs_beat"] = (p.get("apy") or 0) - beat_apy
         filtered.append(p)
 
     if not filtered:
-        print("Ничего не прошло фильтры.")
+        print("Ничего не прошло фильтры доверия.")
         return
 
     compute_scores(filtered)
-    filtered.sort(key=lambda p: p["_score"], reverse=True)
+    if beat_apy is not None:
+        # Внутри уже доверенного набора — сортировка по отрыву от эталона, а не
+        # по общему score: тут важнее конкретно "выше/ближе к моему APY", а не
+        # оборот/TVL сами по себе.
+        filtered.sort(key=lambda p: p["_vs_beat"], reverse=True)
+    else:
+        filtered.sort(key=lambda p: p["_score"], reverse=True)
     top = filtered[: args.top]
 
     if not args.no_save:
         save_snapshot(filtered, date.today().isoformat())
 
     print(f"Рейтинг LP-пулов на {datetime.now():%Y-%m-%d %H:%M} "
-          f"(из {len(filtered)} пулов после фильтров)\n")
+          f"(из {len(filtered)} пулов после фильтров доверия)\n")
+    vs_col = f"{'vs эталон':>10s} " if beat_apy is not None else ""
     print(
-        f"{'#':>3s} {'Сеть':9s} {'Проект':16s} {'Пара':18s} {'Score':>6s} "
+        f"{'#':>3s} {'Сеть':9s} {'Проект':16s} {'Пара':18s} {vs_col}{'Score':>6s} "
         f"{'TVL':>12s} {'APY':>7s} {'30д':>6s} {'Возр':>5s} {'IL':>4s} {'Ауд':>4s} {'Прогноз':>9s}"
     )
-    print("-" * 115)
+    print("-" * (115 + (11 if beat_apy is not None else 0)))
     for rank, p in enumerate(top, start=1):
         spike = p["_spike"]
         spike_str = f"{spike:+.0f}%" if spike is not None else "?"
@@ -397,9 +413,10 @@ def main() -> None:
         # не '?', и формат :>4s упадёт. Нужно "или", а не второй аргумент .get()
         # (найдено независимым аудитом, 2026-07-27).
         il_risk = p.get("ilRisk") or "?"
+        vs_str = f"{p['_vs_beat']:>+9.1f}% " if beat_apy is not None else ""
         print(
             f"{rank:>3d} {p['chain']:9.9s} {p['project']:16.16s} {p['symbol']:18.18s} "
-            f"{p['_score']:>6.1f} ${p['tvlUsd']:>10,.0f} {p['apy']:>6.1f}% "
+            f"{vs_str}{p['_score']:>6.1f} ${p['tvlUsd']:>10,.0f} {p['apy']:>6.1f}% "
             f"{spike_str:>6s} {age_days:>4d}д {il_risk:>4s} "
             f"{p['_audits']:>4d} {pred:>9s}"
         )
