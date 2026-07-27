@@ -105,7 +105,7 @@ def apy_spike_pct(pool: dict, apy: float) -> float | None:
     return (apy - mean30d) / mean30d * 100
 
 
-def effective_apy(pool: dict, fee_only: bool) -> float:
+def effective_apy(pool: dict, fee_only: bool) -> float | None:
     """Какой APY считать "настоящим" для фильтров/сравнения/сортировки: полный
     (apy — комиссии + токен-поощрения от протокола) или только комиссионный
     (apyBase). У Orca весь доход — комиссии (apyBase == apy, apyReward == 0);
@@ -113,11 +113,18 @@ def effective_apy(pool: dict, fee_only: bool) -> float:
     временные токен-эмиссии, которые протокол может урезать в любой момент,
     и по сути другое качество дохода, а не то же самое (найдено независимым
     аудитом логики отбора, 2026-07-27 — например Aerodrome USDC-AERO
-    показывал 110.5% общего APY, из них только 54.8% — реальные комиссии)."""
+    показывал 110.5% общего APY, из них только 54.8% — реальные комиссии).
+
+    При fee_only=True и отсутствующем apyBase возвращает None (пул исключают
+    выше по стеку), а НЕ полный apy — раньше был тихий fallback на apy, из-за
+    которого чисто эмиссионные пулы (Aerodrome v1 / Velodrome v2 — там по
+    дизайну протокола комиссии LP-пула уходят ve-держателям токена
+    управления, а LP получает ТОЛЬКО эмиссию, apyBase там в принципе
+    отсутствует) проходили под видом честных fee-пулов — найдено вторым
+    независимым аудитом логики, 2026-07-27."""
     if fee_only:
         base = pool.get("apyBase")
-        if isinstance(base, (int, float)):
-            return base
+        return base if isinstance(base, (int, float)) else None
     return pool.get("apy") or 0
 
 
@@ -253,17 +260,36 @@ def show_trend(search: str) -> None:
 def parse_beat(spec: str, pools: list[dict]) -> dict:
     """Разбирает 'Сеть/project/Пара' и находит этот пул в общем (нефильтрованном)
     списке — чтобы сравнение было по его apy независимо от того, прошёл бы он
-    сам текущие фильтры (--min-tvl и т.п.) или нет."""
+    сам текущие фильтры (--min-tvl и т.п.) или нет.
+
+    По chain/project/symbol может совпасть НЕСКОЛЬКО пулов (разные fee-тиры
+    того же протокола/пары) — например у Orca SOL-USDC в данных 9 разных
+    пулов, TVL от $16k до $26M. Раньше брался первый по порядку ответа API —
+    порядок API нигде не гарантирован, так что при следующем запуске первым
+    мог бы прийти совсем другой (мелкий) тир, и весь рейтинг "кто обгоняет
+    мой пул" молча уехал бы относительно другого эталона без единого
+    предупреждения (найдено вторым независимым аудитом логики,
+    2026-07-27). Теперь берём детерминированно — пул с максимальным TVL среди
+    совпадений, и явно печатаем сколько было совпадений и TVL выбранного."""
     parts = spec.split("/", 2)
     if len(parts) != 3:
         raise SystemExit(
             f"--beat ожидает 'Сеть/project/Пара', например 'Solana/orca-dex/SOL-USDC', получено {spec!r}"
         )
     chain, project, symbol = parts
-    for p in pools:
-        if p.get("chain") == chain and p.get("project") == project and p.get("symbol") == symbol:
-            return p
-    raise SystemExit(f"Пул {spec!r} не найден в данных DeFiLlama — проверь написание.")
+    matches = [
+        p for p in pools
+        if p.get("chain") == chain and p.get("project") == project and p.get("symbol") == symbol
+    ]
+    if not matches:
+        raise SystemExit(f"Пул {spec!r} не найден в данных DeFiLlama — проверь написание.")
+    chosen = max(matches, key=lambda p: p.get("tvlUsd") or 0)
+    if len(matches) > 1:
+        print(
+            f"Внимание: {len(matches)} пулов с адресом {spec!r} (разные fee-тиры/"
+            f"инстансы) — беру с максимальным TVL: ${chosen.get('tvlUsd') or 0:,.0f}"
+        )
+    return chosen
 
 
 # Именованные наборы флагов — чтобы не запоминать длинные строки. Preset задаёт
@@ -342,6 +368,15 @@ def main() -> None:
         "дней его вообще отслеживают). 0 = не фильтровать",
     )
     parser.add_argument(
+        "--max-turnover-ratio", type=float, default=10,
+        help="Максимальный дневной оборот относительно TVL, в разах (10 = не "
+        "больше 10x TVL в день). Выше обычно значит wash-trading/накрутку "
+        "объёма, а не реальный рынок — найдено независимым аудитом логики "
+        "на живом примере: QUQ-USDT показывал 41x TVL в день при комиссии "
+        "0.01%, у честных пулов выборки 0.1-7x (у эталона Orca ~0.9x). "
+        "0 чтобы отключить",
+    )
+    parser.add_argument(
         "--beat", metavar="Сеть/project/Пара", default=None,
         help="Показать только пулы с APY выше, чем у указанного (например "
         "'Solana/orca-dex/SOL-USDC') — прямое сравнение со своим пулом",
@@ -403,6 +438,11 @@ def main() -> None:
     if args.beat:
         beat_pool = parse_beat(args.beat, pools)
         beat_apy = effective_apy(beat_pool, args.fee_only)
+        if beat_apy is None:
+            raise SystemExit(
+                f"У эталона {args.beat!r} нет apyBase, а --fee-only включён — "
+                f"сравнивать не с чем. Убери --fee-only или выбери другой эталон."
+            )
         apy_kind = "только комиссии (apyBase)" if args.fee_only else "полный APY"
         print(
             f"Сравниваю с {args.beat}: {apy_kind}={beat_apy:.1f}%. Порядок такой: сначала "
@@ -431,6 +471,8 @@ def main() -> None:
             continue
 
         eff_apy = effective_apy(p, args.fee_only)
+        if eff_apy is None:
+            continue
         if eff_apy < args.min_apy:
             continue
         if args.max_apy and eff_apy > args.max_apy:
@@ -446,6 +488,8 @@ def main() -> None:
         # exposure=multi пула теряются только по этой причине). ratio=None
         # теперь просто идёт дальше с нейтральной оценкой в score, не отсекается.
         ratio = daily_turnover_ratio(p)
+        if args.max_turnover_ratio and ratio is not None and ratio > args.max_turnover_ratio:
+            continue
 
         spike = apy_spike_pct(p, eff_apy)
         # abs(), не просто spike — раньше резался только всплеск ВВЕРХ от своей
