@@ -3,3 +3,4 @@ __pycache__/
 venv/
 .env
 history.db
+audit_response*.txt
