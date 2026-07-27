@@ -4,3 +4,4 @@ venv/
 .env
 history.db
 audit_response*.txt
+daily_scan.log

@@ -411,6 +411,11 @@ def main() -> None:
         "сложных процентов и без учёта комиссий за вход/выход/газ)",
     )
     parser.add_argument(
+        "--notify-summary", action="store_true",
+        help="Вместо обычной таблицы — одна короткая строка про пул №1 "
+        "(для системных уведомлений/cron, где длинная таблица не влезает)",
+    )
+    parser.add_argument(
         "--no-save", action="store_true", help="Не сохранять этот запуск в историю"
     )
     parser.add_argument(
@@ -551,6 +556,18 @@ def main() -> None:
 
     if not args.no_save:
         save_snapshot(filtered, date.today().isoformat())
+
+    if args.notify_summary:
+        if not top:
+            print("DeFi-сканер: сегодня пусто, ничего не прошло фильтры.")
+        else:
+            p = top[0]
+            vs = f", {p['_vs_beat']:+.0f}% к эталону" if beat_apy is not None else ""
+            print(
+                f"#1 {p['project']}/{p['symbol']}: {p['_eff_apy']:.0f}% комиссий"
+                f"{vs} (TVL ${p['tvlUsd']:,.0f})"
+            )
+        return
 
     print(f"Рейтинг LP-пулов на {datetime.now():%Y-%m-%d %H:%M} "
           f"(из {len(filtered)} пулов после фильтров доверия)\n")
