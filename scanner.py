@@ -290,8 +290,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--max-apy-spike", type=float, default=None,
-        help="Отсечь пулы, где текущий APY выше среднего за 30д больше чем на X%% "
-        "(защита от разовых всплесков объёма, не устойчивой доходности)",
+        help="Отсечь пулы, где текущий APY отклоняется от своей 30-дневной нормы "
+        "больше чем на X%% В ЛЮБУЮ СТОРОНУ — и разовый всплеск вверх (не "
+        "устойчивая доходность), и просадка вниз (доходность реально ухудшилась) "
+        "одинаково означают нестабильность",
     )
     parser.add_argument(
         "--min-apy", type=float, default=0.5,
@@ -388,7 +390,12 @@ def main() -> None:
             continue
 
         spike = apy_spike_pct(p)
-        if args.max_apy_spike is not None and spike is not None and spike > args.max_apy_spike:
+        # abs(), не просто spike — раньше резался только всплеск ВВЕРХ от своей
+        # 30-дневной нормы, а провал ВНИЗ (доходность реально просела) спокойно
+        # проходил. Поймано на живом примере: Aerodrome WETH-USDC просел с 51.6%
+        # до 25.2% (-48% от нормы) и прошёл фильтр только потому, что -48 не
+        # больше +50 (найдено независимым аудитом логики, 2026-07-27).
+        if args.max_apy_spike is not None and spike is not None and abs(spike) > args.max_apy_spike:
             continue
 
         p["_ratio"] = ratio
