@@ -320,6 +320,12 @@ def main() -> None:
         "'Solana/orca-dex/SOL-USDC') — прямое сравнение со своим пулом",
     )
     parser.add_argument(
+        "--invest", type=float, default=None, metavar="СУММА",
+        help="Показать простой расчёт, сколько бы эта сумма ($) заработала за "
+        "год/месяц на каждом из показанных пулов (просто СУММА * APY, без "
+        "сложных процентов и без учёта комиссий за вход/выход/газ)",
+    )
+    parser.add_argument(
         "--no-save", action="store_true", help="Не сохранять этот запуск в историю"
     )
     parser.add_argument(
@@ -445,6 +451,19 @@ def main() -> None:
           "Raydium тут 0, хотя оба реально аудировались).")
     print("Снимок сохранён в history.db (--no-save чтобы не писать, "
           "--trend 'подстрока' — история, --beat 'Сеть/project/Пара' — сравнить со своим).")
+
+    if args.invest:
+        print(f"\nПростой расчёт для ${args.invest:,.0f} (сумма * APY, без сложных "
+              f"процентов, без комиссий за вход/выход/газ — только ориентир):\n")
+        print(f"{'#':>3s} {'Проект':16s} {'Пара':18s} {'APY':>7s} {'в год':>12s} {'в месяц':>10s}")
+        print("-" * 70)
+        for rank, p in enumerate(top, start=1):
+            per_year = args.invest * p["apy"] / 100
+            per_month = per_year / 12
+            print(
+                f"{rank:>3d} {p['project']:16.16s} {p['symbol']:18.18s} "
+                f"{p['apy']:>6.1f}% ${per_year:>10,.0f} ${per_month:>8,.0f}"
+            )
 
 
 if __name__ == "__main__":
