@@ -11,6 +11,10 @@ DeFi LP-сканер: тянет данные с DeFiLlama (yields.llama.fi/pool
   - стабильность — насколько текущий APY близок к своей 30-дневной норме
   - размер TVL — крупный пул надёжнее/сложнее манипулировать, чем крошечный
 Веса и формула — осознанно простые и прозрачные, не "чёрный ящик".
+
+Плюс дополнительные проверки "на доверие", которые раньше делались вручную:
+возраст пула (сколько дней его вообще отслеживает DeFiLlama) и число
+аудитов самого протокола (второй API-эндпоинт, не тот, что отдаёт пулы).
 """
 import argparse
 import math
@@ -21,6 +25,7 @@ from pathlib import Path
 import requests
 
 POOLS_URL = "https://yields.llama.fi/pools"
+PROTOCOLS_URL = "https://api.llama.fi/protocols"
 DB_PATH = Path(__file__).parent / "history.db"
 
 
@@ -31,6 +36,25 @@ def fetch_pools() -> list[dict]:
     if data.get("status") != "success":
         raise RuntimeError(f"DeFiLlama API вернул статус {data.get('status')!r}")
     return data["data"]
+
+
+def fetch_protocol_audits() -> dict[str, int]:
+    """slug -> число аудитов по данным DeFiLlama. 0/отсутствие в этом словаре не
+    значит "не аудирован" — это может просто значить, что DeFiLlama не занесла
+    данные (например у Orca и Raydium тут 0, хотя оба реально проверялись) —
+    это сигнал "не проверено по этим данным", а не "точно небезопасно"."""
+    resp = requests.get(PROTOCOLS_URL, timeout=30)
+    resp.raise_for_status()
+    result = {}
+    for p in resp.json():
+        slug = p.get("slug")
+        if not slug:
+            continue
+        try:
+            result[slug] = int(p.get("audits") or 0)
+        except (TypeError, ValueError):
+            result[slug] = 0
+    return result
 
 
 def daily_turnover_ratio(pool: dict) -> float | None:
@@ -168,6 +192,22 @@ def show_trend(search: str) -> None:
         )
 
 
+def parse_beat(spec: str, pools: list[dict]) -> dict:
+    """Разбирает 'Сеть/project/Пара' и находит этот пул в общем (нефильтрованном)
+    списке — чтобы сравнение было по его apy независимо от того, прошёл бы он
+    сам текущие фильтры (--min-tvl и т.п.) или нет."""
+    parts = spec.split("/", 2)
+    if len(parts) != 3:
+        raise SystemExit(
+            f"--beat ожидает 'Сеть/project/Пара', например 'Solana/orca-dex/SOL-USDC', получено {spec!r}"
+        )
+    chain, project, symbol = parts
+    for p in pools:
+        if p.get("chain") == chain and p.get("project") == project and p.get("symbol") == symbol:
+            return p
+    raise SystemExit(f"Пул {spec!r} не найден в данных DeFiLlama — проверь написание.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="DeFi LP-сканер поверх DeFiLlama")
     parser.add_argument("--chain", default="Solana", help="Сеть (пусто/'' = все сети)")
@@ -193,6 +233,16 @@ def main() -> None:
         "реальная возможность заработать; 0 чтобы отключить)",
     )
     parser.add_argument(
+        "--min-age-days", type=int, default=0,
+        help="Минимальный возраст пула в днях (поле 'count' в DeFiLlama — сколько "
+        "дней его вообще отслеживают). 0 = не фильтровать",
+    )
+    parser.add_argument(
+        "--beat", metavar="Сеть/project/Пара", default=None,
+        help="Показать только пулы с APY выше, чем у указанного (например "
+        "'Solana/orca-dex/SOL-USDC') — прямое сравнение со своим пулом",
+    )
+    parser.add_argument(
         "--no-save", action="store_true", help="Не сохранять этот запуск в историю"
     )
     parser.add_argument(
@@ -207,6 +257,13 @@ def main() -> None:
         return
 
     pools = fetch_pools()
+    audits_by_slug = fetch_protocol_audits()
+
+    beat_apy = None
+    if args.beat:
+        beat_pool = parse_beat(args.beat, pools)
+        beat_apy = beat_pool.get("apy") or 0
+        print(f"Сравниваю с {args.beat}: APY={beat_apy:.1f}% — показаны только пулы выше этого.\n")
 
     filtered = []
     for p in pools:
@@ -222,6 +279,10 @@ def main() -> None:
             continue
         if (p.get("apy") or 0) < args.min_apy:
             continue
+        if args.min_age_days and (p.get("count") or 0) < args.min_age_days:
+            continue
+        if beat_apy is not None and (p.get("apy") or 0) <= beat_apy:
+            continue
 
         ratio = daily_turnover_ratio(p)
         if ratio is None:
@@ -233,6 +294,7 @@ def main() -> None:
 
         p["_ratio"] = ratio
         p["_spike"] = spike
+        p["_audits"] = audits_by_slug.get(p["project"], 0)
         filtered.append(p)
 
     if not filtered:
@@ -249,25 +311,32 @@ def main() -> None:
     print(f"Рейтинг LP-пулов на {datetime.now():%Y-%m-%d %H:%M} "
           f"(из {len(filtered)} пулов после фильтров)\n")
     print(
-        f"{'#':>3s} {'Сеть':10s} {'Проект':16s} {'Пара':20s} {'Score':>6s} "
-        f"{'TVL':>13s} {'APY':>7s} {'30д':>6s} {'Прогноз':>10s}"
+        f"{'#':>3s} {'Сеть':9s} {'Проект':16s} {'Пара':18s} {'Score':>6s} "
+        f"{'TVL':>12s} {'APY':>7s} {'30д':>6s} {'Возр':>5s} {'IL':>4s} {'Ауд':>4s} {'Прогноз':>9s}"
     )
-    print("-" * 100)
+    print("-" * 115)
     for rank, p in enumerate(top, start=1):
         spike = p["_spike"]
         spike_str = f"{spike:+.0f}%" if spike is not None else "?"
         pred = (p.get("predictions") or {}).get("predictedClass") or "?"
+        age_days = p.get("count") or 0
         print(
-            f"{rank:>3d} {p['chain']:10.10s} {p['project']:16.16s} {p['symbol']:20.20s} "
-            f"{p['_score']:>6.1f} ${p['tvlUsd']:>11,.0f} {p['apy']:>6.1f}% "
-            f"{spike_str:>6s} {pred:>10s}"
+            f"{rank:>3d} {p['chain']:9.9s} {p['project']:16.16s} {p['symbol']:18.18s} "
+            f"{p['_score']:>6.1f} ${p['tvlUsd']:>10,.0f} {p['apy']:>6.1f}% "
+            f"{spike_str:>6s} {age_days:>4d}д {p.get('ilRisk', '?'):>4s} "
+            f"{p['_audits']:>4d} {pred:>9s}"
         )
 
     print(
         "\nScore = 50% место по обороту/TVL + 30% стабильность APY (близость к "
-        "30-дневной норме) + 20% размер TVL. Снимок сохранён в history.db "
-        "(--no-save чтобы не писать, --trend 'подстрока' чтобы посмотреть историю)."
+        "30-дневной норме) + 20% размер TVL."
     )
+    print("Возр = сколько дней DeFiLlama вообще отслеживает этот пул. "
+          "Ауд = число аудитов ПРОТОКОЛА по данным DeFiLlama — 0 может значить "
+          "'не занесено в базу', а не 'точно не проверялся' (например у Orca и "
+          "Raydium тут 0, хотя оба реально аудировались).")
+    print("Снимок сохранён в history.db (--no-save чтобы не писать, "
+          "--trend 'подстрока' — история, --beat 'Сеть/project/Пара' — сравнить со своим).")
 
 
 if __name__ == "__main__":
