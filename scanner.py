@@ -129,13 +129,19 @@ def compute_scores(pools: list[dict]) -> None:
       30% — стабильность = 1 - |отклонение APY от 30д-нормы|, ограничено [0,1]
       20% — размер TVL в лог-шкале относительно остальных в выборке
     """
-    ratios = [p["_ratio"] for p in pools]
+    # ratio может быть None (нет volumeUsd7d — не отсекаем такие пулы совсем,
+    # см. фильтр выше), поэтому для min/max берём только реальные числа; сами
+    # None получат нейтральные 0.5 в цикле ниже, как и spike=None.
+    known_ratios = [p["_ratio"] for p in pools if p["_ratio"] is not None]
     tvls = [math.log10(p["tvlUsd"]) for p in pools]
-    r_min, r_max = min(ratios), max(ratios)
+    r_min, r_max = (min(known_ratios), max(known_ratios)) if known_ratios else (0, 0)
     t_min, t_max = min(tvls), max(tvls)
 
     for p in pools:
-        ratio_norm = (p["_ratio"] - r_min) / (r_max - r_min) if r_max > r_min else 0.5
+        if p["_ratio"] is not None and r_max > r_min:
+            ratio_norm = (p["_ratio"] - r_min) / (r_max - r_min)
+        else:
+            ratio_norm = 0.5
         tvl_norm = (
             (math.log10(p["tvlUsd"]) - t_min) / (t_max - t_min) if t_max > t_min else 0.5
         )
@@ -416,9 +422,14 @@ def main() -> None:
         if args.min_age_days and (p.get("count") or 0) < args.min_age_days:
             continue
 
+        # Раньше отсутствие volumeUsd7d значило "выкинуть пул полностью" — но это
+        # исключает не только реальный мусор, а и легитимные крупные LP-пары
+        # (Convex-обёртки над Curve, GMX-перпетуалы, Morpho — механика дохода не
+        # через своп-объём, поэтому DeFiLlama просто не даёт эту метрику; найдено
+        # независимым аудитом логики, 2026-07-27: 162 крупных/старых
+        # exposure=multi пула теряются только по этой причине). ratio=None
+        # теперь просто идёт дальше с нейтральной оценкой в score, не отсекается.
         ratio = daily_turnover_ratio(p)
-        if ratio is None:
-            continue
 
         spike = apy_spike_pct(p, eff_apy)
         # abs(), не просто spike — раньше резался только всплеск ВВЕРХ от своей
