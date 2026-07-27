@@ -33,9 +33,12 @@ def fetch_pools() -> list[dict]:
     resp = requests.get(POOLS_URL, timeout=30)
     resp.raise_for_status()
     data = resp.json()
-    if data.get("status") != "success":
-        raise RuntimeError(f"DeFiLlama API вернул статус {data.get('status')!r}")
-    return data["data"]
+    if not isinstance(data, dict) or data.get("status") != "success":
+        raise RuntimeError(f"DeFiLlama API (пулы) вернул неожиданный ответ: {data!r:.200}")
+    pools = data.get("data")
+    if not isinstance(pools, list):
+        raise RuntimeError("DeFiLlama API (пулы): поле 'data' отсутствует или не список")
+    return pools
 
 
 def fetch_protocol_audits() -> dict[str, int]:
@@ -45,8 +48,13 @@ def fetch_protocol_audits() -> dict[str, int]:
     это сигнал "не проверено по этим данным", а не "точно небезопасно"."""
     resp = requests.get(PROTOCOLS_URL, timeout=30)
     resp.raise_for_status()
+    protocols = resp.json()
+    if not isinstance(protocols, list):
+        raise RuntimeError("DeFiLlama API (протоколы) вернул не список — не могу прочитать аудиты")
     result = {}
-    for p in resp.json():
+    for p in protocols:
+        if not isinstance(p, dict):
+            continue
         slug = p.get("slug")
         if not slug:
             continue
@@ -55,6 +63,23 @@ def fetch_protocol_audits() -> dict[str, int]:
         except (TypeError, ValueError):
             result[slug] = 0
     return result
+
+
+def is_usable_pool(p: dict) -> bool:
+    """Базовая проверка данных пула — независимо от пользовательских фильтров
+    (--min-tvl 0 и т.п.), пул с нулевым/отсутствующим/нечисловым TVL или без
+    project/symbol нельзя ни оценить, ни осмысленно показать. Раньше такие
+    записи могли проползти дальше и уронить math.log10() или форматирование
+    строки на None (найдено независимым аудитом, 2026-07-27)."""
+    tvl = p.get("tvlUsd")
+    if not isinstance(tvl, (int, float)) or tvl <= 0:
+        return False
+    apy = p.get("apy")
+    if not isinstance(apy, (int, float)):
+        return False
+    if not p.get("project") or not p.get("symbol") or not p.get("chain"):
+        return False
+    return True
 
 
 def daily_turnover_ratio(pool: dict) -> float | None:
@@ -106,54 +131,60 @@ def compute_scores(pools: list[dict]) -> None:
 
 
 def save_snapshot(pools: list[dict], run_date: str) -> None:
+    # try/finally вокруг всего — раньше conn.close() вызывался только на
+    # "счастливом пути"; если бы executemany() или commit() упали (например
+    # из-за неожиданного типа поля), соединение осталось бы висеть открытым
+    # (найдено независимым аудитом, 2026-07-27).
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS snapshots (
-            run_date TEXT NOT NULL,
-            pool_id TEXT NOT NULL,
-            chain TEXT,
-            project TEXT,
-            symbol TEXT,
-            tvl_usd REAL,
-            apy REAL,
-            turnover_ratio REAL,
-            spike_pct REAL,
-            predicted_class TEXT,
-            score REAL,
-            rank INTEGER,
-            PRIMARY KEY (run_date, pool_id)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS snapshots (
+                run_date TEXT NOT NULL,
+                pool_id TEXT NOT NULL,
+                chain TEXT,
+                project TEXT,
+                symbol TEXT,
+                tvl_usd REAL,
+                apy REAL,
+                turnover_ratio REAL,
+                spike_pct REAL,
+                predicted_class TEXT,
+                score REAL,
+                rank INTEGER,
+                PRIMARY KEY (run_date, pool_id)
+            )
+            """
         )
-        """
-    )
-    rows = [
-        (
-            run_date,
-            p["pool"],
-            p["chain"],
-            p["project"],
-            p["symbol"],
-            p["tvlUsd"],
-            p["apy"],
-            p["_ratio"],
-            p["_spike"],
-            (p.get("predictions") or {}).get("predictedClass"),
-            p["_score"],
-            rank,
+        rows = [
+            (
+                run_date,
+                p["pool"],
+                p["chain"],
+                p["project"],
+                p["symbol"],
+                p["tvlUsd"],
+                p["apy"],
+                p["_ratio"],
+                p["_spike"],
+                (p.get("predictions") or {}).get("predictedClass"),
+                p["_score"],
+                rank,
+            )
+            for rank, p in enumerate(pools, start=1)
+        ]
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO snapshots
+            (run_date, pool_id, chain, project, symbol, tvl_usd, apy, turnover_ratio,
+             spike_pct, predicted_class, score, rank)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
         )
-        for rank, p in enumerate(pools, start=1)
-    ]
-    conn.executemany(
-        """
-        INSERT OR REPLACE INTO snapshots
-        (run_date, pool_id, chain, project, symbol, tvl_usd, apy, turnover_ratio,
-         spike_pct, predicted_class, score, rank)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        rows,
-    )
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def show_trend(search: str) -> None:
@@ -164,18 +195,21 @@ def show_trend(search: str) -> None:
         return
 
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
-        SELECT run_date, chain, project, symbol, tvl_usd, apy, turnover_ratio,
-               spike_pct, predicted_class, score, rank
-        FROM snapshots
-        WHERE project LIKE ? OR symbol LIKE ?
-        ORDER BY run_date ASC, rank ASC
-        """,
-        (f"%{search}%", f"%{search}%"),
-    ).fetchall()
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT run_date, chain, project, symbol, tvl_usd, apy, turnover_ratio,
+                   spike_pct, predicted_class, score, rank
+            FROM snapshots
+            WHERE project LIKE ? COLLATE NOCASE
+               OR symbol LIKE ? COLLATE NOCASE
+            ORDER BY run_date ASC, rank ASC
+            """,
+            (f"%{search}%", f"%{search}%"),
+        ).fetchall()
+    finally:
+        conn.close()
 
     if not rows:
         print(f"Ничего не найдено по '{search}' в сохранённой истории.")
@@ -303,6 +337,8 @@ def main() -> None:
 
     filtered = []
     for p in pools:
+        if not is_usable_pool(p):
+            continue
         if args.chain and p.get("chain") != args.chain:
             continue
         if (p.get("tvlUsd") or 0) < args.min_tvl:
@@ -330,7 +366,7 @@ def main() -> None:
 
         p["_ratio"] = ratio
         p["_spike"] = spike
-        p["_audits"] = audits_by_slug.get(p["project"], 0)
+        p["_audits"] = audits_by_slug.get(p.get("project"), 0)
         filtered.append(p)
 
     if not filtered:
@@ -356,10 +392,15 @@ def main() -> None:
         spike_str = f"{spike:+.0f}%" if spike is not None else "?"
         pred = (p.get("predictions") or {}).get("predictedClass") or "?"
         age_days = p.get("count") or 0
+        # .get(key, default) подставляет default только если КЛЮЧА нет — если
+        # ilRisk присутствует, но равен null (Python None), .get вернёт None, а
+        # не '?', и формат :>4s упадёт. Нужно "или", а не второй аргумент .get()
+        # (найдено независимым аудитом, 2026-07-27).
+        il_risk = p.get("ilRisk") or "?"
         print(
             f"{rank:>3d} {p['chain']:9.9s} {p['project']:16.16s} {p['symbol']:18.18s} "
             f"{p['_score']:>6.1f} ${p['tvlUsd']:>10,.0f} {p['apy']:>6.1f}% "
-            f"{spike_str:>6s} {age_days:>4d}д {p.get('ilRisk', '?'):>4s} "
+            f"{spike_str:>6s} {age_days:>4d}д {il_risk:>4s} "
             f"{p['_audits']:>4d} {pred:>9s}"
         )
 
