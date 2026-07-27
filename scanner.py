@@ -92,15 +92,32 @@ def daily_turnover_ratio(pool: dict) -> float | None:
     return (vol7d / 7) / tvl
 
 
-def apy_spike_pct(pool: dict) -> float | None:
+def apy_spike_pct(pool: dict, apy: float) -> float | None:
     """На сколько % текущий APY выше среднего за 30 дней — большое положительное
     значение обычно значит разовый всплеск (например памп объёма вчера), а не
-    устойчивую доходность; отрицательное — текущий APY просел ниже своей нормы."""
-    apy = pool.get("apy")
+    устойчивую доходность; отрицательное — текущий APY просел ниже своей нормы.
+    apy передаётся явно (не всегда p['apy'] — см. effective_apy), чтобы работать
+    одинаково что с полным APY, что с --fee-only."""
     mean30d = pool.get("apyMean30d")
     if apy is None or not mean30d:
         return None
     return (apy - mean30d) / mean30d * 100
+
+
+def effective_apy(pool: dict, fee_only: bool) -> float:
+    """Какой APY считать "настоящим" для фильтров/сравнения/сортировки: полный
+    (apy — комиссии + токен-поощрения от протокола) или только комиссионный
+    (apyBase). У Orca весь доход — комиссии (apyBase == apy, apyReward == 0);
+    у некоторых пулов на других сетях значительная часть "доходности" — это
+    временные токен-эмиссии, которые протокол может урезать в любой момент,
+    и по сути другое качество дохода, а не то же самое (найдено независимым
+    аудитом логики отбора, 2026-07-27 — например Aerodrome USDC-AERO
+    показывал 110.5% общего APY, из них только 54.8% — реальные комиссии)."""
+    if fee_only:
+        base = pool.get("apyBase")
+        if isinstance(base, (int, float)):
+            return base
+    return pool.get("apy") or 0
 
 
 def compute_scores(pools: list[dict]) -> None:
@@ -253,6 +270,7 @@ PRESETS = {
         "min_tvl": 1_000_000,
         "max_apy": 150,
         "max_apy_spike": 50,
+        "fee_only": True,
     },
     "safe": {
         "chain": "",
@@ -322,6 +340,16 @@ def main() -> None:
         "'Solana/orca-dex/SOL-USDC') — прямое сравнение со своим пулом",
     )
     parser.add_argument(
+        "--fee-only", action="store_true",
+        help="Все фильтры/сортировка/--beat считаются по apyBase (только "
+        "торговые комиссии), а не по общему apy (комиссии + токен-поощрения "
+        "протокола). Честнее сравнивать с Orca, где весь доход — комиссии: "
+        "иначе пул может выглядеть 'обгоняет', хотя половина его APY — "
+        "временная эмиссия токена, которую могут срезать в любой момент. "
+        "Колонка 'Комис.' в таблице показывает apyBase всегда, независимо "
+        "от этого флага",
+    )
+    parser.add_argument(
         "--invest", type=float, default=None, metavar="СУММА",
         help="Показать простой расчёт, сколько бы эта сумма ($) заработала за "
         "год/месяц на каждом из показанных пулов (просто СУММА * APY, без "
@@ -352,13 +380,14 @@ def main() -> None:
     beat_apy = None
     if args.beat:
         beat_pool = parse_beat(args.beat, pools)
-        beat_apy = beat_pool.get("apy") or 0
+        beat_apy = effective_apy(beat_pool, args.fee_only)
+        apy_kind = "только комиссии (apyBase)" if args.fee_only else "полный APY"
         print(
-            f"Сравниваю с {args.beat}: APY={beat_apy:.1f}%. Порядок такой: сначала "
+            f"Сравниваю с {args.beat}: {apy_kind}={beat_apy:.1f}%. Порядок такой: сначала "
             f"фильтры доверия (возраст/TVL/и т.п.) отсеивают мусор, ПОТОМ среди "
-            f"оставшихся сортирую по разнице с этим APY — сверху то, что обгоняет "
-            f"сильнее всего, ниже — то, что близко, но пока хуже. Ничего не скрываю, "
-            f"просто ранжирую.\n"
+            f"оставшихся сортирую по разнице с этим значением — сверху то, что "
+            f"обгоняет сильнее всего, ниже — то, что близко, но пока хуже. Ничего не "
+            f"скрываю, просто ранжирую.\n"
         )
 
     # Порядок фильтров — намеренно "доверие сначала": возраст/TVL/минимальный APY
@@ -378,9 +407,11 @@ def main() -> None:
             continue
         if args.stablecoin == "exclude" and p.get("stablecoin"):
             continue
-        if (p.get("apy") or 0) < args.min_apy:
+
+        eff_apy = effective_apy(p, args.fee_only)
+        if eff_apy < args.min_apy:
             continue
-        if args.max_apy and (p.get("apy") or 0) > args.max_apy:
+        if args.max_apy and eff_apy > args.max_apy:
             continue
         if args.min_age_days and (p.get("count") or 0) < args.min_age_days:
             continue
@@ -389,7 +420,7 @@ def main() -> None:
         if ratio is None:
             continue
 
-        spike = apy_spike_pct(p)
+        spike = apy_spike_pct(p, eff_apy)
         # abs(), не просто spike — раньше резался только всплеск ВВЕРХ от своей
         # 30-дневной нормы, а провал ВНИЗ (доходность реально просела) спокойно
         # проходил. Поймано на живом примере: Aerodrome WETH-USDC просел с 51.6%
@@ -400,9 +431,10 @@ def main() -> None:
 
         p["_ratio"] = ratio
         p["_spike"] = spike
+        p["_eff_apy"] = eff_apy
         p["_audits"] = audits_by_slug.get(p.get("project"), 0)
         if beat_apy is not None:
-            p["_vs_beat"] = (p.get("apy") or 0) - beat_apy
+            p["_vs_beat"] = eff_apy - beat_apy
         filtered.append(p)
 
     if not filtered:
@@ -427,9 +459,9 @@ def main() -> None:
     vs_col = f"{'vs эталон':>10s} " if beat_apy is not None else ""
     print(
         f"{'#':>3s} {'Сеть':9s} {'Проект':16s} {'Пара':18s} {vs_col}{'Score':>6s} "
-        f"{'TVL':>12s} {'APY':>7s} {'30д':>6s} {'Возр':>5s} {'IL':>4s} {'Ауд':>4s} {'Прогноз':>9s}"
+        f"{'TVL':>12s} {'APY':>7s} {'Комис.':>7s} {'30д':>6s} {'Возр':>5s} {'IL':>4s} {'Ауд':>4s} {'Прогноз':>9s}"
     )
-    print("-" * (115 + (11 if beat_apy is not None else 0)))
+    print("-" * (123 + (11 if beat_apy is not None else 0)))
     for rank, p in enumerate(top, start=1):
         spike = p["_spike"]
         spike_str = f"{spike:+.0f}%" if spike is not None else "?"
@@ -441,10 +473,15 @@ def main() -> None:
         # (найдено независимым аудитом, 2026-07-27).
         il_risk = p.get("ilRisk") or "?"
         vs_str = f"{p['_vs_beat']:>+9.1f}% " if beat_apy is not None else ""
+        # apyBase — сколько из APY реально комиссии, а не токен-поощрения
+        # протокола; показываем ВСЕГДА, независимо от --fee-only, чтобы разрыв
+        # был виден даже когда фильтры считаются по полному apy.
+        apy_base = p.get("apyBase")
+        apy_base_str = f"{apy_base:>6.1f}%" if isinstance(apy_base, (int, float)) else "     ?"
         print(
             f"{rank:>3d} {p['chain']:9.9s} {p['project']:16.16s} {p['symbol']:18.18s} "
             f"{vs_str}{p['_score']:>6.1f} ${p['tvlUsd']:>10,.0f} {p['apy']:>6.1f}% "
-            f"{spike_str:>6s} {age_days:>4d}д {il_risk:>4s} "
+            f"{apy_base_str} {spike_str:>6s} {age_days:>4d}д {il_risk:>4s} "
             f"{p['_audits']:>4d} {pred:>9s}"
         )
 
@@ -452,6 +489,10 @@ def main() -> None:
         "\nScore = 50% место по обороту/TVL + 30% стабильность APY (близость к "
         "30-дневной норме) + 20% размер TVL."
     )
+    print("Комис. = apyBase — сколько из APY реально торговые комиссии, а не "
+          "токен-поощрения протокола (apyReward = APY - Комис.). Без --fee-only "
+          "фильтры/сортировка считаются по полному APY — эта колонка просто "
+          "показывает разрыв, ничего не отсекая сама по себе.")
     print("Возр = сколько дней DeFiLlama вообще отслеживает этот пул. "
           "Ауд = число аудитов ПРОТОКОЛА по данным DeFiLlama — 0 может значить "
           "'не занесено в базу', а не 'точно не проверялся' (например у Orca и "
@@ -460,16 +501,17 @@ def main() -> None:
           "--trend 'подстрока' — история, --beat 'Сеть/project/Пара' — сравнить со своим).")
 
     if args.invest:
-        print(f"\nПростой расчёт для ${args.invest:,.0f} (сумма * APY, без сложных "
-              f"процентов, без комиссий за вход/выход/газ — только ориентир):\n")
+        basis = "только комиссии, apyBase" if args.fee_only else "полный APY"
+        print(f"\nПростой расчёт для ${args.invest:,.0f} ({basis}; сумма * APY, без "
+              f"сложных процентов, без комиссий за вход/выход/газ — только ориентир):\n")
         print(f"{'#':>3s} {'Проект':16s} {'Пара':18s} {'APY':>7s} {'в год':>12s} {'в месяц':>10s}")
         print("-" * 70)
         for rank, p in enumerate(top, start=1):
-            per_year = args.invest * p["apy"] / 100
+            per_year = args.invest * p["_eff_apy"] / 100
             per_month = per_year / 12
             print(
                 f"{rank:>3d} {p['project']:16.16s} {p['symbol']:18.18s} "
-                f"{p['apy']:>6.1f}% ${per_year:>10,.0f} ${per_month:>8,.0f}"
+                f"{p['_eff_apy']:>6.1f}% ${per_year:>10,.0f} ${per_month:>8,.0f}"
             )
 
 
