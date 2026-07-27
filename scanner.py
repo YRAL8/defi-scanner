@@ -93,16 +93,24 @@ def daily_turnover_ratio(pool: dict) -> float | None:
     return (vol7d / 7) / tvl
 
 
-def apy_spike_pct(pool: dict, apy: float) -> float | None:
-    """На сколько % текущий APY выше среднего за 30 дней — большое положительное
+def apy_spike_pct(pool: dict, apy: float, fee_only: bool) -> float | None:
+    """На сколько % текущий APY отклоняется от своей нормы — большое положительное
     значение обычно значит разовый всплеск (например памп объёма вчера), а не
     устойчивую доходность; отрицательное — текущий APY просел ниже своей нормы.
-    apy передаётся явно (не всегда p['apy'] — см. effective_apy), чтобы работать
-    одинаково что с полным APY, что с --fee-only."""
-    mean30d = pool.get("apyMean30d")
-    if apy is None or not mean30d:
+    apy передаётся явно (не всегда p['apy'] — см. effective_apy).
+
+    Норма берётся той же природы, что и apy: при fee_only сравниваем apyBase с
+    apyBase7d (тоже комиссионная норма, за 7 дней — у DeFiLlama нет
+    комиссионной нормы за 30 дней, это ограничение данных), иначе — с
+    apyMean30d (норма ПОЛНОГО apy). Раньше при fee_only числитель был apyBase,
+    а знаменатель — норма ПОЛНОГО apy, то есть сравнивались разные шкалы: пул с
+    большой долей reward автоматически получал огромное "отклонение" комиссий
+    от чужой нормы, даже если сами комиссии были стабильны (найдено вторым
+    независимым аудитом логики, 2026-07-27)."""
+    norm = pool.get("apyBase7d") if fee_only else pool.get("apyMean30d")
+    if apy is None or not norm:
         return None
-    return (apy - mean30d) / mean30d * 100
+    return (apy - norm) / norm * 100
 
 
 def effective_apy(pool: dict, fee_only: bool) -> float | None:
@@ -300,7 +308,12 @@ PRESETS = {
         "chain": "",
         "beat": "Solana/orca-dex/SOL-USDC",
         "min_age_days": 300,
-        "min_tvl": 1_000_000,
+        # Было $1M против эталона в $26M — оставляло ~треть верхних строк
+        # мемкоин-парами на $1-3M (WSOL-USELESS, GIGA-WSOL и т.п.). Поднято
+        # до $3M — середина диапазона 3-5M, предложенного вторым независимым
+        # аудитом логики (2026-07-27) после проверки на живых
+        # данных: на $1M мусора много, на $5M выборка уже слишком узкая.
+        "min_tvl": 3_000_000,
         "max_apy": 150,
         "max_apy_spike": 50,
         "fee_only": True,
@@ -455,6 +468,15 @@ def main() -> None:
     # Порядок фильтров — намеренно "доверие сначала": возраст/TVL/минимальный APY
     # прежде, чем вообще сравнивать с эталоном. Пул моложе --min-age-days или с
     # тонким TVL отсекается независимо от того, насколько высокий у него APY.
+    # Пулы, отсечённые ТОЛЬКО потолком max_apy, но при этом выглядящие стабильно
+    # (маленький spike относительно своей же нормы) — не выкидываем молча,
+    # показываем отдельным коротким списком "посмотреть глазами" после
+    # основного рейтинга. Найдено вторым независимым аудитом логики
+    # (2026-07-27): потолок 150% отрезал живой стабильный
+    # кандидат (Aerodrome USDC-CBBTC, apyBase 239%, spike всего -5%) вместе с
+    # реальным мусором — потолок нужен, но не должен прятать пограничные случаи.
+    borderline_high_apy = []
+
     filtered = []
     for p in pools:
         if not is_usable_pool(p):
@@ -476,6 +498,11 @@ def main() -> None:
         if eff_apy < args.min_apy:
             continue
         if args.max_apy and eff_apy > args.max_apy:
+            borderline_spike = apy_spike_pct(p, eff_apy, args.fee_only)
+            if borderline_spike is not None and abs(borderline_spike) <= 25:
+                p["_eff_apy"] = eff_apy
+                p["_spike"] = borderline_spike
+                borderline_high_apy.append(p)
             continue
         if args.min_age_days and (p.get("count") or 0) < args.min_age_days:
             continue
@@ -491,7 +518,7 @@ def main() -> None:
         if args.max_turnover_ratio and ratio is not None and ratio > args.max_turnover_ratio:
             continue
 
-        spike = apy_spike_pct(p, eff_apy)
+        spike = apy_spike_pct(p, eff_apy, args.fee_only)
         # abs(), не просто spike — раньше резался только всплеск ВВЕРХ от своей
         # 30-дневной нормы, а провал ВНИЗ (доходность реально просела) спокойно
         # проходил. Поймано на живом примере: Aerodrome WETH-USDC просел с 51.6%
@@ -570,6 +597,19 @@ def main() -> None:
           "Raydium тут 0, хотя оба реально аудировались).")
     print("Снимок сохранён в history.db (--no-save чтобы не писать, "
           "--trend 'подстрока' — история, --beat 'Сеть/project/Пара' — сравнить со своим).")
+
+    if borderline_high_apy:
+        print(
+            f"\nОтсечены потолком --max-apy={args.max_apy}%, но выглядят стабильно "
+            f"(|отклонение от нормы| ≤25%) — не в рейтинге и не в score, просто "
+            f"посмотреть глазами, вдруг зря отсечены:\n"
+        )
+        for p in sorted(borderline_high_apy, key=lambda x: x["_eff_apy"]):
+            print(
+                f"  {p['chain']:9.9s} {p['project']:16.16s} {p['symbol']:18.18s} "
+                f"APY={p['_eff_apy']:.1f}% TVL=${p['tvlUsd']:,.0f} "
+                f"отклонение={p['_spike']:+.0f}%"
+            )
 
     if args.invest:
         basis = "только комиссии, apyBase" if args.fee_only else "полный APY"
