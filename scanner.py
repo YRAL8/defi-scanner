@@ -19,6 +19,7 @@ DeFi LP-сканер: тянет данные с DeFiLlama (yields.llama.fi/pool
 import argparse
 import math
 import sqlite3
+import sys
 from datetime import date, datetime
 from pathlib import Path
 
@@ -372,9 +373,24 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.preset:
+        # Раньше пресет перезаписывал флаги безусловно — нельзя было взять
+        # --preset mine и подкрутить один порог поверх (например --min-tvl),
+        # не переписывая всё вручную (найдено независимым аудитом логики,
+        # 2026-07-27). Теперь пресет применяется только к тем флагам,
+        # которые пользователь НЕ указал явно сам в командной строке.
+        raw_args = sys.argv[1:]
+        applied = {}
         for key, value in PRESETS[args.preset].items():
+            flag = "--" + key.replace("_", "-")
+            explicitly_set = any(a == flag or a.startswith(flag + "=") for a in raw_args)
+            if explicitly_set:
+                continue
             setattr(args, key, value)
-        print(f"Пресет '{args.preset}': {PRESETS[args.preset]}\n")
+            applied[key] = value
+        print(f"Пресет '{args.preset}': {applied}"
+              + (" (часть значений пресета переопределена явными флагами)"
+                 if len(applied) < len(PRESETS[args.preset]) else "")
+              + "\n")
 
     if args.trend:
         show_trend(args.trend)
