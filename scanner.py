@@ -251,6 +251,8 @@ PRESETS = {
         "beat": "Solana/orca-dex/SOL-USDC",
         "min_age_days": 300,
         "min_tvl": 1_000_000,
+        "max_apy": 150,
+        "max_apy_spike": 50,
     },
     "safe": {
         "chain": "",
@@ -296,6 +298,16 @@ def main() -> None:
         help="Минимальный APY, %% (отсекает пулы с огромным оборотом, но APY около "
         "нуля — обычно артефакт данных или почти нулевая комиссия пула, не "
         "реальная возможность заработать; 0 чтобы отключить)",
+    )
+    parser.add_argument(
+        "--max-apy", type=float, default=300,
+        help="Максимальный APY, %% — фильтр доверия, не просто красивое число: "
+        "APY в тысячи процентов почти всегда значит сломанные/манипулируемые "
+        "данные, а не реальную доходность (пример: пул с 34000%% APY и при этом "
+        "просевший на 85%% от своей 30-дневной нормы — то есть его 'норма' была бы "
+        "ещё на порядок безумнее). Отсекается ДО сортировки по --beat, чтобы такой "
+        "мусор не мог оказаться на первом месте только из-за огромного номинала; "
+        "0 чтобы отключить",
     )
     parser.add_argument(
         "--min-age-days", type=int, default=0,
@@ -359,6 +371,8 @@ def main() -> None:
         if args.stablecoin == "exclude" and p.get("stablecoin"):
             continue
         if (p.get("apy") or 0) < args.min_apy:
+            continue
+        if args.max_apy and (p.get("apy") or 0) > args.max_apy:
             continue
         if args.min_age_days and (p.get("count") or 0) < args.min_age_days:
             continue
