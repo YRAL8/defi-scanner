@@ -208,8 +208,39 @@ def parse_beat(spec: str, pools: list[dict]) -> dict:
     raise SystemExit(f"Пул {spec!r} не найден в данных DeFiLlama — проверь написание.")
 
 
+# Именованные наборы флагов — чтобы не запоминать длинные строки. Preset задаёт
+# сеть/--beat/возраст/TVL напрямую (перекрывает эти же флаги, если они тоже
+# указаны в командной строке — простое правило вместо путаницы "что главнее").
+PRESETS = {
+    "mine": {
+        "chain": "",
+        "beat": "Solana/orca-dex/SOL-USDC",
+        "min_age_days": 300,
+        "min_tvl": 1_000_000,
+    },
+    "safe": {
+        "chain": "",
+        "stablecoin": "only",
+        "min_age_days": 500,
+        "min_tvl": 5_000_000,
+    },
+    "explore": {
+        "chain": "",
+        "min_tvl": 200_000,
+        "min_age_days": 0,
+    },
+}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="DeFi LP-сканер поверх DeFiLlama")
+    parser.add_argument(
+        "--preset", choices=sorted(PRESETS), default=None,
+        help="Готовый набор фильтров вместо ручных флагов: "
+        "mine = что обгоняет мой Orca SOL-USDC (не мусор, не новодел); "
+        "safe = только крупные стейбл/стейбл пары; "
+        "explore = вообще всё, без ограничений",
+    )
     parser.add_argument("--chain", default="Solana", help="Сеть (пусто/'' = все сети)")
     parser.add_argument("--min-tvl", type=float, default=1_000_000, help="Минимальный TVL, $")
     parser.add_argument("--top", type=int, default=15, help="Сколько мест показать")
@@ -251,6 +282,11 @@ def main() -> None:
         "вместо обычного рейтинга"
     )
     args = parser.parse_args()
+
+    if args.preset:
+        for key, value in PRESETS[args.preset].items():
+            setattr(args, key, value)
+        print(f"Пресет '{args.preset}': {PRESETS[args.preset]}\n")
 
     if args.trend:
         show_trend(args.trend)
