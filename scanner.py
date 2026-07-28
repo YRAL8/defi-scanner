@@ -176,6 +176,8 @@ def save_snapshot(pools: list[dict], run_date: str) -> None:
     # (найдено независимым аудитом, 2026-07-27).
     conn = sqlite3.connect(DB_PATH)
     try:
+        # Идемпотентная миграция: база может уже существовать (и содержать старые
+        # снимки) — добавляем новые колонки без пересоздания таблицы.
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS snapshots (
@@ -186,6 +188,8 @@ def save_snapshot(pools: list[dict], run_date: str) -> None:
                 symbol TEXT,
                 tvl_usd REAL,
                 apy REAL,
+                apy_base REAL,
+                apy_base7d REAL,
                 turnover_ratio REAL,
                 spike_pct REAL,
                 predicted_class TEXT,
@@ -195,6 +199,15 @@ def save_snapshot(pools: list[dict], run_date: str) -> None:
             )
             """
         )
+        cols = {
+            r[1]
+            for r in conn.execute("PRAGMA table_info(snapshots)").fetchall()
+            if isinstance(r, (tuple, list)) and len(r) > 1
+        }
+        if "apy_base" not in cols:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN apy_base REAL")
+        if "apy_base7d" not in cols:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN apy_base7d REAL")
         rows = [
             (
                 run_date,
@@ -204,6 +217,8 @@ def save_snapshot(pools: list[dict], run_date: str) -> None:
                 p["symbol"],
                 p["tvlUsd"],
                 p["apy"],
+                p.get("apyBase") if isinstance(p.get("apyBase"), (int, float)) else None,
+                p.get("apyBase7d") if isinstance(p.get("apyBase7d"), (int, float)) else None,
                 p["_ratio"],
                 p["_spike"],
                 (p.get("predictions") or {}).get("predictedClass"),
@@ -215,9 +230,9 @@ def save_snapshot(pools: list[dict], run_date: str) -> None:
         conn.executemany(
             """
             INSERT OR REPLACE INTO snapshots
-            (run_date, pool_id, chain, project, symbol, tvl_usd, apy, turnover_ratio,
-             spike_pct, predicted_class, score, rank)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (run_date, pool_id, chain, project, symbol, tvl_usd, apy, apy_base, apy_base7d,
+             turnover_ratio, spike_pct, predicted_class, score, rank)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -386,7 +401,7 @@ def main() -> None:
         "больше 10x TVL в день). Выше обычно значит wash-trading/накрутку "
         "объёма, а не реальный рынок — найдено независимым аудитом логики "
         "на живом примере: QUQ-USDT показывал 41x TVL в день при комиссии "
-        "0.01%, у честных пулов выборки 0.1-7x (у эталона Orca ~0.9x). "
+        "0.01%%, у честных пулов выборки 0.1-7x (у эталона Orca ~0.9x). "
         "0 чтобы отключить",
     )
     parser.add_argument(
@@ -401,8 +416,14 @@ def main() -> None:
         "протокола). Честнее сравнивать с Orca, где весь доход — комиссии: "
         "иначе пул может выглядеть 'обгоняет', хотя половина его APY — "
         "временная эмиссия токена, которую могут срезать в любой момент. "
-        "Колонка 'Комис.' в таблице показывает apyBase всегда, независимо "
+        "Колонка 'Ком/день' в таблице показывает apyBase всегда, независимо "
         "от этого флага",
+    )
+    parser.add_argument(
+        "--rank-by", choices=["week", "day"], default="week",
+        help="Как ранжировать комиссионный APY в режиме --fee-only: week = по "
+        "apyBase7d (если есть), day = по apyBase (старое поведение). "
+        "Игнорируется без --fee-only.",
     )
     parser.add_argument(
         "--invest", type=float, default=None, metavar="СУММА",
@@ -453,15 +474,41 @@ def main() -> None:
     audits_by_slug = fetch_protocol_audits()
 
     beat_apy = None
+    rank_by = args.rank_by
     if args.beat:
         beat_pool = parse_beat(args.beat, pools)
-        beat_apy = effective_apy(beat_pool, args.fee_only)
-        if beat_apy is None:
+        beat_day = effective_apy(beat_pool, args.fee_only)
+        beat_week = beat_pool.get("apyBase7d")
+        if args.fee_only and beat_day is None:
             raise SystemExit(
                 f"У эталона {args.beat!r} нет apyBase, а --fee-only включён — "
                 f"сравнивать не с чем. Убери --fee-only или выбери другой эталон."
             )
-        apy_kind = "только комиссии (apyBase)" if args.fee_only else "полный APY"
+        if args.fee_only and rank_by == "week":
+            if isinstance(beat_week, (int, float)):
+                beat_apy = float(beat_week)
+            else:
+                print(
+                    f"Предупреждение: у эталона {args.beat!r} нет apyBase7d, поэтому "
+                    f"сравнение 'неделя против недели' невозможно. Откатываюсь на "
+                    f"сравнение по дневным комиссиям (apyBase) для ВСЕХ в этом запуске "
+                    f"(эквивалентно --rank-by day).\n"
+                )
+                rank_by = "day"
+                beat_apy = beat_day
+        else:
+            beat_apy = beat_day
+
+        if beat_apy is None:
+            # Возможен только когда args.fee_only=False и у пула нет apy/нечисловой apy
+            raise SystemExit(
+                f"У эталона {args.beat!r} нет APY — сравнивать не с чем. "
+                f"Выбери другой эталон."
+            )
+        apy_kind = (
+            "комиссии за 7д (apyBase7d)" if (args.fee_only and rank_by == "week") else
+            ("только комиссии (apyBase)" if args.fee_only else "полный APY")
+        )
         print(
             f"Сравниваю с {args.beat}: {apy_kind}={beat_apy:.1f}%. Порядок такой: сначала "
             f"фильтры доверия (возраст/TVL/и т.п.) отсеивают мусор, ПОТОМ среди "
@@ -481,6 +528,7 @@ def main() -> None:
     # кандидат (Aerodrome USDC-CBBTC, apyBase 239%, spike всего -5%) вместе с
     # реальным мусором — потолок нужен, но не должен прятать пограничные случаи.
     borderline_high_apy = []
+    missing_weekly_fees = []
 
     filtered = []
     for p in pools:
@@ -536,8 +584,16 @@ def main() -> None:
         p["_spike"] = spike
         p["_eff_apy"] = eff_apy
         p["_audits"] = audits_by_slug.get(p.get("project"), 0)
-        if beat_apy is not None:
-            p["_vs_beat"] = eff_apy - beat_apy
+        if args.fee_only and rank_by == "week":
+            week_val = p.get("apyBase7d")
+            if not isinstance(week_val, (int, float)):
+                missing_weekly_fees.append(p)
+                continue
+            if beat_apy is not None:
+                p["_vs_beat"] = float(week_val) - beat_apy
+        else:
+            if beat_apy is not None:
+                p["_vs_beat"] = eff_apy - beat_apy
         filtered.append(p)
 
     if not filtered:
@@ -574,9 +630,10 @@ def main() -> None:
     vs_col = f"{'vs эталон':>10s} " if beat_apy is not None else ""
     print(
         f"{'#':>3s} {'Сеть':9s} {'Проект':16s} {'Пара':18s} {vs_col}{'Score':>6s} "
-        f"{'TVL':>12s} {'APY':>7s} {'Комис.':>7s} {'30д':>6s} {'Возр':>5s} {'IL':>4s} {'Ауд':>4s} {'Прогноз':>9s}"
+        f"{'TVL':>12s} {'APY':>7s} {'Ком/день':>8s} {'Ком/нед':>8s} {'30д':>6s} "
+        f"{'Возр':>5s} {'IL':>4s} {'Ауд':>4s} {'Прогноз':>9s}"
     )
-    print("-" * (123 + (11 if beat_apy is not None else 0)))
+    print("-" * (132 + (11 if beat_apy is not None else 0)))
     for rank, p in enumerate(top, start=1):
         spike = p["_spike"]
         spike_str = f"{spike:+.0f}%" if spike is not None else "?"
@@ -592,11 +649,13 @@ def main() -> None:
         # протокола; показываем ВСЕГДА, независимо от --fee-only, чтобы разрыв
         # был виден даже когда фильтры считаются по полному apy.
         apy_base = p.get("apyBase")
-        apy_base_str = f"{apy_base:>6.1f}%" if isinstance(apy_base, (int, float)) else "     ?"
+        apy_base_str = f"{apy_base:>6.1f}%" if isinstance(apy_base, (int, float)) else "      ?"
+        apy_base7d = p.get("apyBase7d")
+        apy_base7d_str = f"{apy_base7d:>6.1f}%" if isinstance(apy_base7d, (int, float)) else "      ?"
         print(
             f"{rank:>3d} {p['chain']:9.9s} {p['project']:16.16s} {p['symbol']:18.18s} "
             f"{vs_str}{p['_score']:>6.1f} ${p['tvlUsd']:>10,.0f} {p['apy']:>6.1f}% "
-            f"{apy_base_str} {spike_str:>6s} {age_days:>4d}д {il_risk:>4s} "
+            f"{apy_base_str} {apy_base7d_str} {spike_str:>6s} {age_days:>4d}д {il_risk:>4s} "
             f"{p['_audits']:>4d} {pred:>9s}"
         )
 
@@ -604,16 +663,36 @@ def main() -> None:
         "\nScore = 50% место по обороту/TVL + 30% стабильность APY (близость к "
         "30-дневной норме) + 20% размер TVL."
     )
-    print("Комис. = apyBase — сколько из APY реально торговые комиссии, а не "
-          "токен-поощрения протокола (apyReward = APY - Комис.). Без --fee-only "
-          "фильтры/сортировка считаются по полному APY — эта колонка просто "
-          "показывает разрыв, ничего не отсекая сама по себе.")
+    print("Ком/день = apyBase, Ком/нед = apyBase7d — сколько из APY реально торговые "
+          "комиссии (apyReward = APY - apyBase). Без --fee-only фильтры/сортировка "
+          "считаются по полному APY — эти колонки просто показывают разрыв, ничего "
+          "не отсекая сами по себе.")
     print("Возр = сколько дней DeFiLlama вообще отслеживает этот пул. "
           "Ауд = число аудитов ПРОТОКОЛА по данным DeFiLlama — 0 может значить "
           "'не занесено в базу', а не 'точно не проверялся' (например у Orca и "
           "Raydium тут 0, хотя оба реально аудировались).")
-    print("Снимок сохранён в history.db (--no-save чтобы не писать, "
-          "--trend 'подстрока' — история, --beat 'Сеть/project/Пара' — сравнить со своим).")
+    # Раньше эта строка печаталась безусловно — то есть при --no-save инструмент
+    # сообщал о сохранении, которого не было. Врать о собственных действиях нельзя.
+    if args.no_save:
+        print("Снимок НЕ сохранён (--no-save). "
+              "--trend 'подстрока' — история, --beat 'Сеть/project/Пара' — сравнить со своим.")
+    else:
+        print("Снимок сохранён в history.db (--no-save чтобы не писать, "
+              "--trend 'подстрока' — история, --beat 'Сеть/project/Пара' — сравнить со своим).")
+
+    if args.fee_only and rank_by == "week" and missing_weekly_fees:
+        print(
+            "\nБез недельного подтверждения комиссий (apyBase7d отсутствует) — НЕ в рейтинге, "
+            "НЕ в score и НЕ в history: дневное значение apyBase может быть случайным "
+            "всплеском объёма.\n"
+        )
+        for p in sorted(missing_weekly_fees, key=lambda x: x.get("apyBase") or 0, reverse=True)[:15]:
+            apy_base = p.get("apyBase")
+            apy_base_str = f"{apy_base:.1f}%" if isinstance(apy_base, (int, float)) else "?"
+            print(
+                f"  {p['chain']:9.9s} {p['project']:16.16s} {p['symbol']:18.18s} "
+                f"Ком/день={apy_base_str:>6s} TVL=${p['tvlUsd']:,.0f}"
+            )
 
     if borderline_high_apy:
         print(
