@@ -19,15 +19,229 @@ DeFi LP-сканер: тянет данные с DeFiLlama (yields.llama.fi/pool
 import argparse
 import math
 import sqlite3
+import statistics
 import sys
-from datetime import date, datetime
+import time
+import random
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
 
 POOLS_URL = "https://yields.llama.fi/pools"
 PROTOCOLS_URL = "https://api.llama.fi/protocols"
+CHART_URL_TMPL = "https://yields.llama.fi/chart/{}"
 DB_PATH = Path(__file__).parent / "history.db"
+
+CHART_SLEEP_SECONDS = 0.30
+TODAY_REFRESH_TTL_SECONDS = 60 * 60  # не долбить API при двух прогонах подряд
+
+_SESSION = requests.Session()
+_SESSION.headers.update({"User-Agent": "defi-scanner (public DeFiLlama API)"})
+
+
+def iso_day(ts: object) -> str | None:
+    if not isinstance(ts, str) or len(ts) < 10:
+        return None
+    # timestamp в chart-эндпоинте: '2026-07-28T16:01:52.188Z'
+    return ts[:10]
+
+
+def required_days_window(days: int, end: date | None = None) -> tuple[str, str, set[str]]:
+    end_d = end or date.today()
+    start_d = end_d - timedelta(days=days - 1)
+    start_s = start_d.isoformat()
+    end_s = end_d.isoformat()
+    req = {(start_d + timedelta(days=i)).isoformat() for i in range(days)}
+    return start_s, end_s, req
+
+
+def init_history_db(conn: sqlite3.Connection) -> None:
+    """Создаёт/мигрирует историю. Идемпотентно."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS snapshots (
+            run_date TEXT NOT NULL,
+            pool_id TEXT NOT NULL,
+            chain TEXT,
+            project TEXT,
+            symbol TEXT,
+            tvl_usd REAL,
+            apy REAL,
+            apy_base REAL,
+            apy_base7d REAL,
+            apy_base_median REAL,
+            turnover_ratio REAL,
+            spike_pct REAL,
+            predicted_class TEXT,
+            score REAL,
+            rank INTEGER,
+            PRIMARY KEY (run_date, pool_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pool_chart (
+            pool_id TEXT NOT NULL,
+            day TEXT NOT NULL,
+            apy_base REAL,
+            tvl_usd REAL,
+            fetched_at INTEGER NOT NULL,
+            PRIMARY KEY (pool_id, day)
+        )
+        """
+    )
+    cols = {
+        r[1]
+        for r in conn.execute("PRAGMA table_info(snapshots)").fetchall()
+        if isinstance(r, (tuple, list)) and len(r) > 1
+    }
+    if "apy_base" not in cols:
+        conn.execute("ALTER TABLE snapshots ADD COLUMN apy_base REAL")
+    if "apy_base7d" not in cols:
+        conn.execute("ALTER TABLE snapshots ADD COLUMN apy_base7d REAL")
+    if "apy_base_median" not in cols:
+        conn.execute("ALTER TABLE snapshots ADD COLUMN apy_base_median REAL")
+
+
+def fetch_pool_chart(pool_id: str) -> list[dict]:
+    # Чужой бесплатный API: без параллелизма, с повторами на 429/5xx.
+    last_exc: Exception | None = None
+    for attempt in range(6):
+        try:
+            resp = _SESSION.get(CHART_URL_TMPL.format(pool_id), timeout=30)
+            if resp.status_code == 429:
+                # экспоненциальный бэкофф с лёгким jitter
+                wait = min(20.0, 0.8 * (2**attempt)) + random.random() * 0.3
+                time.sleep(wait)
+                continue
+            if 500 <= resp.status_code < 600:
+                wait = min(10.0, 0.5 * (2**attempt)) + random.random() * 0.2
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            payload = resp.json()
+            if not isinstance(payload, dict) or payload.get("status") != "success":
+                raise RuntimeError(
+                    f"DeFiLlama API (chart) вернул неожиданный ответ: {payload!r:.200}"
+                )
+            data = payload.get("data")
+            if not isinstance(data, list):
+                raise RuntimeError("DeFiLlama API (chart): поле 'data' отсутствует или не список")
+            return data
+        except Exception as e:  # noqa: BLE001 - внешняя сеть/JSON/SQLite, не роняем прогон
+            last_exc = e
+            wait = min(6.0, 0.3 * (2**attempt)) + random.random() * 0.2
+            time.sleep(wait)
+            continue
+
+    assert last_exc is not None
+    raise last_exc
+
+
+def ensure_pool_chart_cached(
+    conn: sqlite3.Connection,
+    pool_id: str,
+    median_days: int,
+) -> bool:
+    """Гарантирует, что в pool_chart есть данные за нужное окно (N дней),
+    при необходимости тянет chart-эндпоинт и upsert-ит только нужные дни.
+
+    Возвращает True, если был сетевой запрос (для паузы между запросами).
+    """
+    start_day, end_day, req_days = required_days_window(median_days)
+    now = int(time.time())
+
+    rows = conn.execute(
+        """
+        SELECT day, fetched_at
+        FROM pool_chart
+        WHERE pool_id = ?
+          AND day >= ?
+          AND day <= ?
+        """,
+        (pool_id, start_day, end_day),
+    ).fetchall()
+    seen = {r[0] for r in rows if r and isinstance(r[0], str)}
+    fetched_at_by_day = {r[0]: int(r[1] or 0) for r in rows if r and isinstance(r[0], str)}
+
+    missing = req_days - seen
+    today = date.today().isoformat()
+    today_stale = today in fetched_at_by_day and (now - fetched_at_by_day[today]) > TODAY_REFRESH_TTL_SECONDS
+
+    if not missing and not today_stale:
+        return False
+
+    chart = fetch_pool_chart(pool_id)
+
+    # На случай нескольких точек в день — берём последнюю по timestamp (они идут по времени).
+    by_day: dict[str, dict] = {}
+    for item in chart:
+        if not isinstance(item, dict):
+            continue
+        d = iso_day(item.get("timestamp"))
+        if not d or d < start_day or d > end_day:
+            continue
+        by_day[d] = item
+
+    to_upsert_days = set(missing)
+    if today_stale:
+        to_upsert_days.add(today)
+
+    to_insert = []
+    for d in sorted(to_upsert_days):
+        item = by_day.get(d)
+        if not item:
+            continue
+        apy_base = item.get("apyBase")
+        tvl_usd = item.get("tvlUsd")
+        to_insert.append(
+            (
+                pool_id,
+                d,
+                float(apy_base) if isinstance(apy_base, (int, float)) else None,
+                float(tvl_usd) if isinstance(tvl_usd, (int, float)) else None,
+                now,
+            )
+        )
+
+    if to_insert:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO pool_chart (pool_id, day, apy_base, tvl_usd, fetched_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            to_insert,
+        )
+        conn.commit()
+    return True
+
+
+def apy_base_median_from_cache(
+    conn: sqlite3.Connection,
+    pool_id: str,
+    median_days: int,
+) -> tuple[float | None, int]:
+    start_day, end_day, _ = required_days_window(median_days)
+    vals = [
+        r[0]
+        for r in conn.execute(
+            """
+            SELECT apy_base
+            FROM pool_chart
+            WHERE pool_id = ?
+              AND day >= ?
+              AND day <= ?
+              AND apy_base IS NOT NULL
+            """,
+            (pool_id, start_day, end_day),
+        ).fetchall()
+        if r and isinstance(r[0], (int, float))
+    ]
+    if len(vals) < (median_days / 2):
+        return None, len(vals)
+    return float(statistics.median(vals)), len(vals)
 
 
 def fetch_pools() -> list[dict]:
@@ -176,38 +390,7 @@ def save_snapshot(pools: list[dict], run_date: str) -> None:
     # (найдено независимым аудитом, 2026-07-27).
     conn = sqlite3.connect(DB_PATH)
     try:
-        # Идемпотентная миграция: база может уже существовать (и содержать старые
-        # снимки) — добавляем новые колонки без пересоздания таблицы.
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS snapshots (
-                run_date TEXT NOT NULL,
-                pool_id TEXT NOT NULL,
-                chain TEXT,
-                project TEXT,
-                symbol TEXT,
-                tvl_usd REAL,
-                apy REAL,
-                apy_base REAL,
-                apy_base7d REAL,
-                turnover_ratio REAL,
-                spike_pct REAL,
-                predicted_class TEXT,
-                score REAL,
-                rank INTEGER,
-                PRIMARY KEY (run_date, pool_id)
-            )
-            """
-        )
-        cols = {
-            r[1]
-            for r in conn.execute("PRAGMA table_info(snapshots)").fetchall()
-            if isinstance(r, (tuple, list)) and len(r) > 1
-        }
-        if "apy_base" not in cols:
-            conn.execute("ALTER TABLE snapshots ADD COLUMN apy_base REAL")
-        if "apy_base7d" not in cols:
-            conn.execute("ALTER TABLE snapshots ADD COLUMN apy_base7d REAL")
+        init_history_db(conn)
         rows = [
             (
                 run_date,
@@ -219,6 +402,7 @@ def save_snapshot(pools: list[dict], run_date: str) -> None:
                 p["apy"],
                 p.get("apyBase") if isinstance(p.get("apyBase"), (int, float)) else None,
                 p.get("apyBase7d") if isinstance(p.get("apyBase7d"), (int, float)) else None,
+                p.get("_apy_base_median") if isinstance(p.get("_apy_base_median"), (int, float)) else None,
                 p["_ratio"],
                 p["_spike"],
                 (p.get("predictions") or {}).get("predictedClass"),
@@ -230,9 +414,9 @@ def save_snapshot(pools: list[dict], run_date: str) -> None:
         conn.executemany(
             """
             INSERT OR REPLACE INTO snapshots
-            (run_date, pool_id, chain, project, symbol, tvl_usd, apy, apy_base, apy_base7d,
+            (run_date, pool_id, chain, project, symbol, tvl_usd, apy, apy_base, apy_base7d, apy_base_median,
              turnover_ratio, spike_pct, predicted_class, score, rank)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -420,10 +604,16 @@ def main() -> None:
         "от этого флага",
     )
     parser.add_argument(
-        "--rank-by", choices=["week", "day"], default="week",
+        "--rank-by", choices=["median", "week", "day"], default="median",
         help="Как ранжировать комиссионный APY в режиме --fee-only: week = по "
-        "apyBase7d (если есть), day = по apyBase (старое поведение). "
+        "apyBase7d (если есть), day = по apyBase, median = медиана apyBase по "
+        "последним N дням из chart-эндпоинта (см. --median-days). "
         "Игнорируется без --fee-only.",
+    )
+    parser.add_argument(
+        "--median-days", type=int, default=30, metavar="N",
+        help="Сколько последних дней брать для медианы комиссионного APY (apyBase) "
+        "из chart-эндпоинта. Используется только в --fee-only и --rank-by median.",
     )
     parser.add_argument(
         "--invest", type=float, default=None, metavar="СУММА",
@@ -475,6 +665,15 @@ def main() -> None:
 
     beat_apy = None
     rank_by = args.rank_by
+    median_days = max(int(args.median_days or 30), 1)
+    if args.fee_only and rank_by == "median" and median_days < 2:
+        raise SystemExit("--median-days должен быть ≥ 2, иначе медиана бессмысленна.")
+
+    conn = None
+    if args.fee_only:
+        conn = sqlite3.connect(DB_PATH)
+        init_history_db(conn)
+
     if args.beat:
         beat_pool = parse_beat(args.beat, pools)
         beat_day = effective_apy(beat_pool, args.fee_only)
@@ -484,7 +683,21 @@ def main() -> None:
                 f"У эталона {args.beat!r} нет apyBase, а --fee-only включён — "
                 f"сравнивать не с чем. Убери --fee-only или выбери другой эталон."
             )
-        if args.fee_only and rank_by == "week":
+        if args.fee_only and rank_by == "median":
+            try:
+                assert conn is not None
+                did_fetch = ensure_pool_chart_cached(conn, beat_pool["pool"], median_days)
+                if did_fetch:
+                    time.sleep(CHART_SLEEP_SECONDS)
+                beat_med, beat_cnt = apy_base_median_from_cache(conn, beat_pool["pool"], median_days)
+            except Exception as e:
+                raise SystemExit(f"Не смог посчитать медиану для эталона {args.beat!r}: {e}")
+            if beat_med is None:
+                raise SystemExit(
+                    f"У эталона {args.beat!r} мало данных для медианы: {beat_cnt} дней из {median_days}."
+                )
+            beat_apy = beat_med
+        elif args.fee_only and rank_by == "week":
             if isinstance(beat_week, (int, float)):
                 beat_apy = float(beat_week)
             else:
@@ -506,8 +719,9 @@ def main() -> None:
                 f"Выбери другой эталон."
             )
         apy_kind = (
-            "комиссии за 7д (apyBase7d)" if (args.fee_only and rank_by == "week") else
-            ("только комиссии (apyBase)" if args.fee_only else "полный APY")
+            (f"медиана комиссий за {median_days}д (apyBase)" if (args.fee_only and rank_by == "median") else
+             ("комиссии за 7д (apyBase7d)" if (args.fee_only and rank_by == "week") else
+              ("только комиссии (apyBase)" if args.fee_only else "полный APY")))
         )
         print(
             f"Сравниваю с {args.beat}: {apy_kind}={beat_apy:.1f}%. Порядок такой: сначала "
@@ -528,7 +742,7 @@ def main() -> None:
     # кандидат (Aerodrome USDC-CBBTC, apyBase 239%, spike всего -5%) вместе с
     # реальным мусором — потолок нужен, но не должен прятать пограничные случаи.
     borderline_high_apy = []
-    missing_weekly_fees = []
+    low_median_data = []
 
     filtered = []
     for p in pools:
@@ -584,16 +798,38 @@ def main() -> None:
         p["_spike"] = spike
         p["_eff_apy"] = eff_apy
         p["_audits"] = audits_by_slug.get(p.get("project"), 0)
-        if args.fee_only and rank_by == "week":
-            week_val = p.get("apyBase7d")
-            if not isinstance(week_val, (int, float)):
-                missing_weekly_fees.append(p)
+
+        # Медиана комиссий по истории (chart) — считаем для всех fee_only, чтобы
+        # показывать рядом с day/week и (при rank_by=median) ранжировать по ней.
+        if args.fee_only:
+            try:
+                assert conn is not None
+                did_fetch = ensure_pool_chart_cached(conn, p["pool"], median_days)
+                if did_fetch:
+                    time.sleep(CHART_SLEEP_SECONDS)
+                med, cnt = apy_base_median_from_cache(conn, p["pool"], median_days)
+                p["_apy_base_median"] = med
+                p["_apy_base_median_days"] = cnt
+            except Exception as e:
+                print(f"Предупреждение: не смог загрузить chart для пула {p.get('pool')}: {e}", file=sys.stderr)
+                p["_apy_base_median"] = None
+                p["_apy_base_median_days"] = 0
+
+            if rank_by == "median" and p["_apy_base_median"] is None:
+                low_median_data.append(p)
                 continue
-            if beat_apy is not None:
-                p["_vs_beat"] = float(week_val) - beat_apy
-        else:
-            if beat_apy is not None:
-                p["_vs_beat"] = eff_apy - beat_apy
+
+        if beat_apy is not None:
+            if args.fee_only and rank_by == "median":
+                metric = p.get("_apy_base_median")
+            elif args.fee_only and rank_by == "week":
+                metric = p.get("apyBase7d") if isinstance(p.get("apyBase7d"), (int, float)) else None
+            elif args.fee_only and rank_by == "day":
+                metric = eff_apy
+            else:
+                metric = eff_apy
+            p["_vs_beat"] = (float(metric) - beat_apy) if isinstance(metric, (int, float)) else None
+
         filtered.append(p)
 
     if not filtered:
@@ -605,7 +841,12 @@ def main() -> None:
         # Внутри уже доверенного набора — сортировка по отрыву от эталона, а не
         # по общему score: тут важнее конкретно "выше/ближе к моему APY", а не
         # оборот/TVL сами по себе.
-        filtered.sort(key=lambda p: p["_vs_beat"], reverse=True)
+        filtered.sort(
+            key=lambda p: (
+                p.get("_vs_beat") is None,
+                -(float(p["_vs_beat"]) if isinstance(p.get("_vs_beat"), (int, float)) else 0.0),
+            )
+        )
     else:
         filtered.sort(key=lambda p: p["_score"], reverse=True)
     top = filtered[: args.top]
@@ -630,10 +871,10 @@ def main() -> None:
     vs_col = f"{'vs эталон':>10s} " if beat_apy is not None else ""
     print(
         f"{'#':>3s} {'Сеть':9s} {'Проект':16s} {'Пара':18s} {vs_col}{'Score':>6s} "
-        f"{'TVL':>12s} {'APY':>7s} {'Ком/день':>8s} {'Ком/нед':>8s} {'30д':>6s} "
+        f"{'TVL':>12s} {'APY':>7s} {'Ком/день':>8s} {'Ком/нед':>8s} {'Мед':>8s} {'д/мед':>6s} {'30д':>6s} "
         f"{'Возр':>5s} {'IL':>4s} {'Ауд':>4s} {'Прогноз':>9s}"
     )
-    print("-" * (132 + (11 if beat_apy is not None else 0)))
+    print("-" * (148 + (11 if beat_apy is not None else 0)))
     for rank, p in enumerate(top, start=1):
         spike = p["_spike"]
         spike_str = f"{spike:+.0f}%" if spike is not None else "?"
@@ -644,7 +885,11 @@ def main() -> None:
         # не '?', и формат :>4s упадёт. Нужно "или", а не второй аргумент .get()
         # (найдено независимым аудитом, 2026-07-27).
         il_risk = p.get("ilRisk") or "?"
-        vs_str = f"{p['_vs_beat']:>+9.1f}% " if beat_apy is not None else ""
+        if beat_apy is not None:
+            vs_val = p.get("_vs_beat")
+            vs_str = f"{vs_val:>+9.1f}% " if isinstance(vs_val, (int, float)) else f"{'?':>10s} "
+        else:
+            vs_str = ""
         # apyBase — сколько из APY реально комиссии, а не токен-поощрения
         # протокола; показываем ВСЕГДА, независимо от --fee-only, чтобы разрыв
         # был виден даже когда фильтры считаются по полному apy.
@@ -652,19 +897,40 @@ def main() -> None:
         apy_base_str = f"{apy_base:>6.1f}%" if isinstance(apy_base, (int, float)) else "      ?"
         apy_base7d = p.get("apyBase7d")
         apy_base7d_str = f"{apy_base7d:>6.1f}%" if isinstance(apy_base7d, (int, float)) else "      ?"
+        med = p.get("_apy_base_median")
+        med_str = f"{med:>6.1f}%" if isinstance(med, (int, float)) else "      ?"
+        # Отношение "сегодня / медиана" — главный индикатор всплеска, ради которого
+        # вся эта затея. Около 1.0 — доходность настоящая; заметно выше — сегодня
+        # повезло с объёмом (так мы 27.07 выбрали Aerodrome по 62.4% при реальных
+        # ~21-23%); заметно ниже — доходность затухает. Считаем сами, а не заставляем
+        # человека делить в уме две соседние колонки.
+        if isinstance(apy_base, (int, float)) and isinstance(med, (int, float)) and med > 0.05:
+            ratio = apy_base / med
+            ratio_str = f"{ratio:>5.1f}x" if ratio < 100 else "  >99x"
+        elif isinstance(apy_base, (int, float)) and apy_base > 0.05:
+            # медиана ~нулевая, а сегодня доходность есть — всплеск на пустом месте
+            ratio_str = "    ∞"
+        else:
+            ratio_str = "    ?"
         print(
             f"{rank:>3d} {p['chain']:9.9s} {p['project']:16.16s} {p['symbol']:18.18s} "
             f"{vs_str}{p['_score']:>6.1f} ${p['tvlUsd']:>10,.0f} {p['apy']:>6.1f}% "
-            f"{apy_base_str} {apy_base7d_str} {spike_str:>6s} {age_days:>4d}д {il_risk:>4s} "
-            f"{p['_audits']:>4d} {pred:>9s}"
+            f"{apy_base_str} {apy_base7d_str} {med_str} {ratio_str} {spike_str:>6s} "
+            f"{age_days:>4d}д {il_risk:>4s} {p['_audits']:>4d} {pred:>9s}"
         )
 
     print(
         "\nScore = 50% место по обороту/TVL + 30% стабильность APY (близость к "
         "30-дневной норме) + 20% размер TVL."
     )
+    print("д/мед = во сколько раз сегодняшняя доходность выше своей же медианы. "
+          "Около 1.0 — доходность настоящая. Заметно больше — сегодня просто повезло с "
+          "объёмом торгов, завтра так не будет (по такому пику 27.07 был выбран пул "
+          "Aerodrome с 62.4%, реально дающий ~21-23%). Заметно меньше 1.0 — доходность "
+          "затухает. '∞' — медиана почти нулевая, то есть всплеск на ровном месте.")
     print("Ком/день = apyBase, Ком/нед = apyBase7d — сколько из APY реально торговые "
-          "комиссии (apyReward = APY - apyBase). Без --fee-only фильтры/сортировка "
+          "комиссии (apyReward = APY - apyBase). Мед = медиана apyBase по chart-истории "
+          f"за последние {median_days}д (если --fee-only). Без --fee-only фильтры/сортировка "
           "считаются по полному APY — эти колонки просто показывают разрыв, ничего "
           "не отсекая сами по себе.")
     print("Возр = сколько дней DeFiLlama вообще отслеживает этот пул. "
@@ -680,18 +946,18 @@ def main() -> None:
         print("Снимок сохранён в history.db (--no-save чтобы не писать, "
               "--trend 'подстрока' — история, --beat 'Сеть/project/Пара' — сравнить со своим).")
 
-    if args.fee_only and rank_by == "week" and missing_weekly_fees:
+    if args.fee_only and low_median_data:
         print(
-            "\nБез недельного подтверждения комиссий (apyBase7d отсутствует) — НЕ в рейтинге, "
-            "НЕ в score и НЕ в history: дневное значение apyBase может быть случайным "
-            "всплеском объёма.\n"
+            f"\nМало данных для медианы (нужно ≥ {median_days/2:.0f} дней из {median_days}) — "
+            "не в рейтинге при --rank-by median:\n"
         )
-        for p in sorted(missing_weekly_fees, key=lambda x: x.get("apyBase") or 0, reverse=True)[:15]:
+        for p in sorted(low_median_data, key=lambda x: x.get("apyBase") or 0, reverse=True)[:15]:
             apy_base = p.get("apyBase")
             apy_base_str = f"{apy_base:.1f}%" if isinstance(apy_base, (int, float)) else "?"
+            have = int(p.get("_apy_base_median_days") or 0)
             print(
                 f"  {p['chain']:9.9s} {p['project']:16.16s} {p['symbol']:18.18s} "
-                f"Ком/день={apy_base_str:>6s} TVL=${p['tvlUsd']:,.0f}"
+                f"Ком/день={apy_base_str:>6s} дней={have:>2d}/{median_days} TVL=${p['tvlUsd']:,.0f}"
             )
 
     if borderline_high_apy:
@@ -720,6 +986,9 @@ def main() -> None:
                 f"{rank:>3d} {p['project']:16.16s} {p['symbol']:18.18s} "
                 f"{p['_eff_apy']:>6.1f}% ${per_year:>10,.0f} ${per_month:>8,.0f}"
             )
+
+    if conn is not None:
+        conn.close()
 
 
 if __name__ == "__main__":
